@@ -1,10 +1,11 @@
-use std::{borrow::Cow, fmt::Display};
+use std::{borrow::Cow, collections::HashMap, fmt::Display};
 
 use futures::{join, stream::iter, StreamExt};
 use log::{debug, info, warn};
 
+use rand::Rng;
 use serenity::{
-    all::{ChannelType, EditMember, GuildMemberUpdateEvent},
+    all::{ChannelType, EditMember, GuildMemberUpdateEvent, Role, RoleId},
     async_trait,
     client::Cache,
     model::{
@@ -26,6 +27,7 @@ use crate::db::{
 
 const LEAGUE_OF_LEGENDS_APPLICATION_ID: Option<ApplicationId> =
     Some(ApplicationId::new(401518684763586560));
+const BOT_USER_ID: UserId = UserId::new(1125768259841577021);
 
 fn current_champion_from_activities<'a, I: IntoIterator<Item = &'a Activity>>(
     activities: I,
@@ -43,17 +45,6 @@ fn current_champion_from_activities<'a, I: IntoIterator<Item = &'a Activity>>(
 }
 struct Handler {
     db: Db,
-}
-
-fn gen_derangement(size: usize) -> Vec<usize> {
-    if size > 1 {
-        let mut rng = rand::thread_rng();
-        derangement::derange::Derange::new(&mut rng, size)
-            .map()
-            .to_vec()
-    } else {
-        vec![0; size]
-    }
 }
 
 async fn set_nicks<'a, S: Into<String> + Display, I: IntoIterator<Item = (UserId, S)>>(
@@ -252,6 +243,24 @@ impl EventHandler for Handler {
             .unwrap();
     }
 }
+
+fn max_role_position<'a, I: IntoIterator<Item = &'a RoleId>>(
+    roles: &HashMap<RoleId, Role>,
+    role_ids: I,
+) -> u16 {
+    if let Some(min_role_position) = role_ids
+        .into_iter()
+        .flat_map(|role_id| roles.get(role_id))
+        .map(|role| role.position)
+        .max()
+    {
+        min_role_position
+    } else {
+        warn!("No roles found");
+        0
+    }
+}
+
 impl Handler {
     async fn process_voice_state_update(&self, ctx: &Context, voice_state: &VoiceState) {
         if let Some(guild_id) = voice_state.guild_id {
@@ -265,28 +274,78 @@ impl Handler {
         let members = channel_members(&ctx.cache, guild_id, channel_id)
             .await
             .unwrap_or(vec![]);
-        let derangement = gen_derangement(members.len());
-        let (names, new_nicks) = if let Some(guild) = guild_id.to_guild_cached(&ctx.cache) {
-            let names = self.db.open_tree(DbKey::from(guild_id)).unwrap();
-            let new_nicks:Vec<_> = members.iter().enumerate().map(|(user_id_index, member)| {
-                let from_user = &members[derangement[user_id_index]].user;
-                let source_champion_named = guild.presences.get(&from_user.id).and_then(|presence|current_champion_from_activities(&presence.activities));
-                let new_nick = if let Some(champion) = source_champion_named {
+        let (names, new_nicks) = if let Some(guild) = ctx.cache.guild(guild_id) {
+            // Find the bot's role's max position. Discord only permits us to rename people with "lower" roles than us.
+            // It's okay to recompute this every time since it can get dragged around while we're still running
+            let bot_max_role_position = max_role_position(
+                &guild.roles,
+                &guild.members.get(&BOT_USER_ID).unwrap().roles,
+            );
+            info!("Bot's max role position is {bot_max_role_position}");
+            let mut renamable_members: Vec<_> = members
+                .iter()
+                .filter(|member| {
+                    let position = max_role_position(&guild.roles, &member.roles);
                     info!(
-                        "Selected champion {champion} (from {} ({})) as nick for {} ({})",
-                        from_user.name, from_user.id, member.user.name, member.user.id
+                        "User {} ({}). Max role pos {position} (vs bot: {bot_max_role_position}).",
+                        member.user.name, member.user.id
                     );
-                    // Allows us to drop guild which can't be held across await boundaries.
-                    Cow::Owned(champion.to_string())
-                } else if let Some(nick) = get_name(&names, DbKey::from(member.user.id) ){
-                    info!("Could not determine champion for {} ({}). Selected historical nick {nick} for {} ({})", from_user.name, from_user.id, member.user.name, member.user.id);
+                    position < bot_max_role_position
+                })
+                .collect();
+
+            let mut r = rand::thread_rng();
+
+            // First assign champion names to members at random since champion names are the first choice.
+            let mut new_nicks: Vec<_> = members
+                .iter()
+                .flat_map(|member| {
+                    if let Some(champion_name) = current_champion_from_activities(
+                        &guild.presences.get(&member.user.id)?.activities,
+                    ) {
+                        Some((member, champion_name))
+                    } else {
+                        info!(
+                            "Didn't detect champion for {} ({})",
+                            member.user.name, member.user.id
+                        );
+                        None
+                    }
+                })
+                .map_while(|(member, champion_name)| {
+                    if renamable_members.is_empty() {
+                        None
+                    } else {
+                        let n = r.gen_range(0..renamable_members.len());
+                        let n = if renamable_members[n].user.id == member.user.id {
+                            (n + 1) % renamable_members.len()
+                        } else {
+                            n
+                        };
+                        let selected_member_to_rename = renamable_members.swap_remove(n);
+                        info!("Selected {champion_name} for {selected_member_to_rename:?}");
+                        Some((
+                            selected_member_to_rename.user.id,
+                            Cow::Owned(champion_name.to_string()),
+                        ))
+                    }
+                })
+                .collect();
+            let names = self.db.open_tree(DbKey::from(guild_id)).unwrap();
+            // Fall back to reassigning their old nickname or current user name.
+            new_nicks.extend(renamable_members.into_iter().map(|member| {
+                let nick = if let Some(nick) = get_name(&names, DbKey::from(member.user.id)) {
+                    info!("Assigning {member:?} their old nick {nick}");
                     Cow::Owned(nick)
                 } else {
-                    info!("Could not determine champion for {} ({}). Selected username for {} ({})", from_user.name, from_user.id, member.user.name, member.user.id);
+                    info!(
+                        "Assigning {member:?} their original user name {}",
+                        member.user.name
+                    );
                     Cow::Borrowed(member.user.name.as_str())
                 };
-                (member.user.id, new_nick)
-            }).collect();
+                (member.user.id, nick)
+            }));
             (names, new_nicks)
         } else {
             warn!("Failed to sync nicknames for guild {guild_id} because the guild wasn't found in the cache");
