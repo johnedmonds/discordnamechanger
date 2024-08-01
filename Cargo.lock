@@ -401,16 +401,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derangement"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8357786c95e4d66ead358fc326f9b2606b2419a6d649e3c5f1cfdaea21c6f201"
-dependencies = [
- "rand",
- "serde",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -425,7 +415,6 @@ name = "discordnamechanger"
 version = "0.1.0"
 dependencies = [
  "clap",
- "derangement",
  "futures",
  "itertools",
  "log",
