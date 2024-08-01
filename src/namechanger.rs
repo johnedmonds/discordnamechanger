@@ -281,6 +281,7 @@ impl Handler {
                 &guild.roles,
                 &guild.members.get(&BOT_USER_ID).unwrap().roles,
             );
+            info!("Bot's max role position is {bot_max_role_position}");
             let mut renamable_members: Vec<_> = members
                 .iter()
                 .filter(|member| {
@@ -299,12 +300,17 @@ impl Handler {
             let mut new_nicks: Vec<_> = members
                 .iter()
                 .flat_map(|member| {
-                    Some((
-                        member,
-                        current_champion_from_activities(
-                            &guild.presences.get(&member.user.id)?.activities,
-                        )?,
-                    ))
+                    if let Some(champion_name) = current_champion_from_activities(
+                        &guild.presences.get(&member.user.id)?.activities,
+                    ) {
+                        Some((member, champion_name))
+                    } else {
+                        info!(
+                            "Didn't detect champion for {} ({})",
+                            member.user.name, member.user.id
+                        );
+                        None
+                    }
                 })
                 .map_while(|(member, champion_name)| {
                     if renamable_members.is_empty() {
@@ -316,8 +322,10 @@ impl Handler {
                         } else {
                             n
                         };
+                        let selected_member_to_rename = renamable_members.swap_remove(n);
+                        info!("Selected {champion_name} for {selected_member_to_rename:?}");
                         Some((
-                            renamable_members.swap_remove(n).user.id,
+                            selected_member_to_rename.user.id,
                             Cow::Owned(champion_name.to_string()),
                         ))
                     }
@@ -327,8 +335,13 @@ impl Handler {
             // Fall back to reassigning their old nickname or current user name.
             new_nicks.extend(renamable_members.into_iter().map(|member| {
                 let nick = if let Some(nick) = get_name(&names, DbKey::from(member.user.id)) {
+                    info!("Assigning {member:?} their old nick {nick}");
                     Cow::Owned(nick)
                 } else {
+                    info!(
+                        "Assigning {member:?} their original user name {}",
+                        member.user.name
+                    );
                     Cow::Borrowed(member.user.name.as_str())
                 };
                 (member.user.id, nick)
